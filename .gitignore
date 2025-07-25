@@ -1,0 +1,16 @@
+# 확장자가 없는 파일
+*
+!*/
+!*.*
+!Makefile
+!makefile
+!README
+!LICENSE
+!CHANGELOG
+!CONTRIBUTING
+
+# 실행 파일
+*.out
+
+# 오브젝트 파일
+*.o
