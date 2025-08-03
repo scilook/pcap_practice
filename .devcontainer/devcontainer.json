@@ -1,0 +1,16 @@
+{
+    "name": "My C Development Environment with Features",
+    "image": "mcr.microsoft.com/devcontainers/universal:latest",
+    "features": {
+        "ghcr.io/devcontainers/features/apt-get:1": { //apt-get 사용
+            "packages": "libpcap-dev" // 쉼표로 구분하여 여러 패키지 지정
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools"
+            ]
+        }
+    }
+}

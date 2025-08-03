@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <time.h>
 
 // IP 헤더 구조체 정의
 struct ip_header {
@@ -47,338 +48,494 @@ struct tcp_header {
     u_short th_urp;                 /* urgent pointer */
 };
 
-// Global handle for pcap session
-pcap_t *g_handle;
+// 세션 식별을 위한 4-튜플 구조체
+typedef struct {
+    char src_ip[16];
+    char dst_ip[16];
+    unsigned short src_port;
+    unsigned short dst_port;
+} session_key_t;
 
-// Log structure to hold session statistics
-typedef struct s_pcap_log
-{
-	struct timeval first_ts;
-	struct timeval last_ts;
-	long long packets;
-	long long bytes;
-	// For simplified RTT: store SYN timestamp
-	struct timeval syn_ts;
-	double rtt; // in ms
-	int syn_seen;
-	int syn_ack_seen;
-} t_pcap_log;
+// SEQ 번호와 타임스탬프를 저장하는 구조체 (RTT 계산용)
+typedef struct seq_entry {
+    u_int seq_num;
+    struct timeval timestamp;
+    struct seq_entry *next;
+} seq_entry_t;
 
-// Function to list and select network interfaces
-char* find_best_device() {
-	char errbuf[PCAP_ERRBUF_SIZE];
-	pcap_if_t *alldevs, *device;
-	char *selected_dev = NULL;
-	int i = 0;
+// 1초별 처리율 계산을 위한 구조체
+typedef struct throughput_entry {
+    time_t second;
+    long bytes;
+    struct throughput_entry *next;
+} throughput_entry_t;
 
-	// Get list of all devices
-	if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-		printf("[ERROR] Error in pcap_findalldevs: %s\n", errbuf);
-		return NULL;
-	}
+// 각 TCP 세션을 식별하고 추적하기 위한 구조체
+typedef struct tcp_session {
+    char src_ip[16];                 // 출발지 IP
+    char dst_ip[16];                 // 목적지 IP
+    unsigned short src_port;         // 출발지 포트
+    unsigned short dst_port;         // 목적지 포트
 
-	printf("[INFO] Available network interfaces:\n");
-	
-	// Print all available devices
-	for (device = alldevs; device != NULL; device = device->next) {
-		printf("  %d. %s", ++i, device->name);
-		if (device->description) {
-			printf(" (%s)", device->description);
-		}
-		printf("\n");
-		
-		// Select first non-loopback interface or any interface if available
-		if (selected_dev == NULL && 
-		    strcmp(device->name, "lo") != 0 && 
-		    strcmp(device->name, "any") != 0) {
-			selected_dev = strdup(device->name);
-		}
-	}
+    // RTT 계산용 변수
+    double conn_rtt;                 // 연결 수립 RTT (3-way handshake)
+    double latest_data_rtt;          // 최근 데이터 RTT
+    seq_entry_t *pending_seqs;       // 대기 중인 SEQ 번호들 (RTT 계산용)
+    
+    // 핸드셰이크 추적
+    int syn_seen;
+    struct timeval syn_time;
+    int syn_ack_seen;
+    int established;
 
-	// If no specific interface found, try to use the first one
-	if (selected_dev == NULL && alldevs != NULL) {
-		selected_dev = strdup(alldevs->name);
-	}
+    // 처리율 계산용 변수
+    long long total_bytes;           // 총 전송 바이트
+    struct timeval first_packet_time; // 세션 첫 패킷 시간
+    struct timeval last_packet_time;  // 세션 마지막 패킷 시간
+    throughput_entry_t *throughput_list; // 1초별 처리율 저장
 
-	pcap_freealldevs(alldevs);
-	return selected_dev;
-}
+    // 재전송 탐지용 변수
+    int retrans_count;               // 재전송 카운트
+    seq_entry_t *seen_seqs;          // 이미 확인된 SEQ 번호들
 
-// Global log instance
-t_pcap_log g_log;
+    int total_packets;               // 총 패킷 수
+    int session_closed;              // 세션 종료 상태
 
-// Initialize pcap session
-int setup_pcap(const char *device) {
+    struct tcp_session *next;        // 연결 리스트용 포인터
+} tcp_session_t;
+
+// 전역 변수
+tcp_session_t *session_list = NULL;  // 세션 연결 리스트
+pcap_t *g_handle = NULL;
+
+// 함수 선언
+void signal_handler(int signum);
+void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
+tcp_session_t* find_or_create_session(session_key_t *key);
+void process_packet(tcp_session_t *session, const struct pcap_pkthdr *header, 
+                   const struct ip_header *ip_hdr, const struct tcp_header *tcp_hdr, int payload_len);
+void add_seq_entry(seq_entry_t **list, u_int seq_num, struct timeval timestamp);
+double calculate_rtt(seq_entry_t **list, u_int ack_num, struct timeval current_time);
+void update_throughput(tcp_session_t *session, int bytes, struct timeval timestamp);
+void detect_retransmission(tcp_session_t *session, u_int seq_num);
+void print_session_summary(tcp_session_t *session);
+void print_all_sessions();
+void cleanup_sessions();
+session_key_t create_session_key(const struct ip_header *ip_hdr, const struct tcp_header *tcp_hdr);
+
+int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
-    
-    // Create pcap handle
-    g_handle = pcap_create(device, errbuf);
+    char *device;
+    struct bpf_program fp;
+    bpf_u_int32 net, mask;
+
+    // 신호 핸들러 등록
+    signal(SIGINT, signal_handler);
+
+    // 네트워크 디바이스 찾기
+    device = pcap_lookupdev(errbuf);
+    if (device == NULL) {
+        fprintf(stderr, "Error finding device: %s\n", errbuf);
+        return 1;
+    }
+
+    printf("Using device: %s\n", device);
+
+    // 네트워크 정보 가져오기
+    if (pcap_lookupnet(device, &net, &mask, errbuf) == -1) {
+        fprintf(stderr, "Error getting network info: %s\n", errbuf);
+        net = 0;
+        mask = 0;
+    }
+
+    // pcap 핸들 생성
+    g_handle = pcap_open_live(device, BUFSIZ, 1, 1000, errbuf);
     if (g_handle == NULL) {
-        printf("[ERROR] pcap_create failed: %s\n", errbuf);
-        return -1;
+        fprintf(stderr, "Error opening device: %s\n", errbuf);
+        return 1;
     }
-    
-    // Set options
-    pcap_set_snaplen(g_handle, BUFSIZ);
-    pcap_set_promisc(g_handle, 1);
-    pcap_set_timeout(g_handle, 1000);
-    
-    // Activate the handle
-    int ret = pcap_activate(g_handle);
-    if (ret != 0) {
-        printf("[ERROR] pcap_activate failed: %s\n", pcap_statustostr(ret));
-        pcap_close(g_handle);
-        return -1;
+
+    // TCP 필터 설정
+    char filter_exp[] = "tcp";
+    if (pcap_compile(g_handle, &fp, filter_exp, 0, net) == -1) {
+        fprintf(stderr, "Error compiling filter: %s\n", pcap_geterr(g_handle));
+        return 1;
     }
-    
-	// Apply more specific filter for common protocols
-	struct bpf_program fp;
-	// Filter for TCP traffic on common ports (HTTP, HTTPS, SSH, etc.)
-	const char *filter = "tcp and (port 80 or port 443 or port 22 or port 21 or port 23 or port 25 or port 53 or port 3389)";
-	if (pcap_compile(g_handle, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == -1) {
-		printf("[ERROR] pcap_compile failed: %s\n", pcap_geterr(g_handle));
-		pcap_close(g_handle);
-		return -1;
-	}    if (pcap_setfilter(g_handle, &fp) == -1) {
-        printf("[ERROR] pcap_setfilter failed: %s\n", pcap_geterr(g_handle));
-        pcap_freecode(&fp);
-        pcap_close(g_handle);
-        return -1;
+
+    if (pcap_setfilter(g_handle, &fp) == -1) {
+        fprintf(stderr, "Error setting filter: %s\n", pcap_geterr(g_handle));
+        return 1;
     }
-    
+
+    printf("Starting TCP session monitoring...\n");
+    printf("Press Ctrl+C to stop and view summary\n\n");
+
+    // 패킷 캡처 시작
+    pcap_loop(g_handle, -1, pcap_callback, NULL);
+
+    // 정리 작업
     pcap_freecode(&fp);
+    pcap_close(g_handle);
+    print_all_sessions();
+    cleanup_sessions();
+
     return 0;
 }
 
-// Function to print summary
-void print_summary() {
-	double duration = (g_log.last_ts.tv_sec - g_log.first_ts.tv_sec) * 1000.0; // s to ms
-	duration += (g_log.last_ts.tv_usec - g_log.first_ts.tv_usec) / 1000.0; // us to ms
-
-	double throughput_kbps = 0;
-	if (duration > 0) {
-		throughput_kbps = (g_log.bytes * 8) / (duration / 1000.0) / 1000.0; // kbps
-	}
-
-	printf("\n=== TCP Session Analysis Report ===\n");
-	printf("Total packets captured: %lld\n", g_log.packets);
-	printf("Total bytes captured: %lld\n", g_log.bytes);
-	printf("Session duration: %.2f ms\n", duration);
-	printf("Average throughput: %.2f kbps\n", throughput_kbps);
-	if (g_log.rtt > 0) {
-		printf("Initial RTT (SYN->SYN/ACK): %.3f ms\n", g_log.rtt);
-	} else {
-		printf("Initial RTT: Not captured (handshake not observed)\n");
-	}
-	printf("=====================================\n");
+void signal_handler(int signum) {
+    printf("\n\n[SIGNAL] SIGINT received, stopping capture...\n");
+    if (g_handle) {
+        pcap_breakloop(g_handle);
+    }
 }
 
-// Signal handler for SIGINT
-void signal_handler(int signum)
-{
-	printf("\n[SIGNAL] SIGINT received, stopping capture...\n");
-	if (g_handle) {
-		pcap_breakloop(g_handle);
-	}
+// 세션 키 생성 함수
+session_key_t create_session_key(const struct ip_header *ip_hdr, const struct tcp_header *tcp_hdr) {
+    session_key_t key;
+    
+    // 양방향 통신을 같은 세션으로 인식하기 위해 정규화
+    // 작은 IP:Port를 src로, 큰 IP:Port를 dst로 설정
+    uint32_t ip1 = ntohl(ip_hdr->ip_src.s_addr);
+    uint32_t ip2 = ntohl(ip_hdr->ip_dst.s_addr);
+    uint16_t port1 = ntohs(tcp_hdr->th_sport);
+    uint16_t port2 = ntohs(tcp_hdr->th_dport);
+    
+    if (ip1 < ip2 || (ip1 == ip2 && port1 < port2)) {
+        strcpy(key.src_ip, inet_ntoa(ip_hdr->ip_src));
+        strcpy(key.dst_ip, inet_ntoa(ip_hdr->ip_dst));
+        key.src_port = port1;
+        key.dst_port = port2;
+    } else {
+        strcpy(key.src_ip, inet_ntoa(ip_hdr->ip_dst));
+        strcpy(key.dst_ip, inet_ntoa(ip_hdr->ip_src));
+        key.src_port = port2;
+        key.dst_port = port1;
+    }
+    
+    return key;
 }
 
-// pcap callback function
-void pcap_callback(u_char *user_data, const struct pcap_pkthdr *header, const u_char *packet)
-{
-	t_pcap_log *log = (t_pcap_log *)user_data;
-
-	if (log->packets == 0) {
-		log->first_ts = header->ts;
-		printf("[INFO] First packet captured at %ld.%06ld\n", 
-		       header->ts.tv_sec, (long)header->ts.tv_usec);
-		printf("[INFO] Starting packet analysis...\n");
-	}
-	log->last_ts = header->ts;
-	log->packets++;
-
-	// Calculate time since start
-	double time_since_start = (header->ts.tv_sec - log->first_ts.tv_sec) * 1000.0;
-	time_since_start += (header->ts.tv_usec - log->first_ts.tv_usec) / 1000.0;
-
-	// Parse Ethernet header
-	struct ether_header *eth_header = (struct ether_header *)packet;
-	if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
-		// Not an IP packet, skip
-		return;
-	}
-
-	// Parse IP header
-	struct ip_header *ip_header = (struct ip_header *)(packet + sizeof(struct ether_header));
-	int ip_header_len = (ip_header->ip_vhl & 0x0f) * 4;
-	if (ip_header->ip_p != IPPROTO_TCP) {
-		// Not a TCP packet, skip
-		return;
-	}
-	
-	// Parse TCP header
-	struct tcp_header *tcp_header = (struct tcp_header *)(packet + sizeof(struct ether_header) + ip_header_len);
-	int tcp_header_len = TH_OFF(tcp_header) * 4;
-	int payload_len = ntohs(ip_header->ip_len) - ip_header_len - tcp_header_len;
-	if (payload_len > 0) {
-		log->bytes += payload_len;
-	}
-
-	// Print packet info for demonstration
-	printf("[%6.2f ms] [PACKET %lld] TCP %s:%d -> %s:%d, Payload: %d bytes, Flags: ",
-	       time_since_start,
-	       log->packets,
-	       inet_ntoa(ip_header->ip_src), ntohs(tcp_header->th_sport),
-	       inet_ntoa(ip_header->ip_dst), ntohs(tcp_header->th_dport),
-	       payload_len);
-	
-	if (tcp_header->th_flags & TH_SYN) printf("SYN ");
-	if (tcp_header->th_flags & TH_ACK) printf("ACK ");
-	if (tcp_header->th_flags & TH_FIN) printf("FIN ");
-	if (tcp_header->th_flags & TH_RST) printf("RST ");
-	if (tcp_header->th_flags & TH_PUSH) printf("PSH ");
-	if (tcp_header->th_flags & TH_URG) printf("URG ");
-	printf("\n");
-
-	// Show payload preview for interesting packets
-	if (payload_len > 0) {
-		const u_char *payload = packet + sizeof(struct ether_header) + ip_header_len + tcp_header_len;
-		printf("[PAYLOAD] First 32 bytes: ");
-		for (int i = 0; i < payload_len && i < 32; i++) {
-			if (payload[i] >= 32 && payload[i] <= 126) {
-				printf("%c", payload[i]);
-			} else {
-				printf(".");
-			}
-		}
-		printf("\n");
-	}
-
-	// Simplified RTT calculation for the first handshake
-	if (!log->syn_seen && tcp_header->th_flags & TH_SYN && !(tcp_header->th_flags & TH_ACK)) {
-		log->syn_ts = header->ts;
-		log->syn_seen = 1;
-		printf("[RTT] SYN packet detected, storing timestamp\n");
-	} else if (log->syn_seen && !log->syn_ack_seen && (tcp_header->th_flags & (TH_SYN | TH_ACK))) {
-		log->syn_ack_seen = 1;
-		double syn_time = log->syn_ts.tv_sec * 1000.0 + log->syn_ts.tv_usec / 1000.0;
-		double syn_ack_time = header->ts.tv_sec * 1000.0 + header->ts.tv_usec / 1000.0;
-		log->rtt = syn_ack_time - syn_time;
-		printf("[RTT] SYN/ACK packet detected, RTT calculated: %.3f ms\n", log->rtt);
-	}
+// 세션 찾기 또는 새로 생성
+tcp_session_t* find_or_create_session(session_key_t *key) {
+    tcp_session_t *current = session_list;
+    
+    // 기존 세션 찾기
+    while (current != NULL) {
+        if (strcmp(current->src_ip, key->src_ip) == 0 &&
+            strcmp(current->dst_ip, key->dst_ip) == 0 &&
+            current->src_port == key->src_port &&
+            current->dst_port == key->dst_port) {
+            return current;
+        }
+        current = current->next;
+    }
+    
+    // 새 세션 생성
+    tcp_session_t *new_session = malloc(sizeof(tcp_session_t));
+    if (new_session == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return NULL;
+    }
+    
+    // 세션 초기화
+    memset(new_session, 0, sizeof(tcp_session_t));
+    strcpy(new_session->src_ip, key->src_ip);
+    strcpy(new_session->dst_ip, key->dst_ip);
+    new_session->src_port = key->src_port;
+    new_session->dst_port = key->dst_port;
+    
+    // 리스트에 추가
+    new_session->next = session_list;
+    session_list = new_session;
+    
+    printf("[NEW SESSION] %s:%d <-> %s:%d\n", 
+           new_session->src_ip, new_session->src_port,
+           new_session->dst_ip, new_session->dst_port);
+    
+    return new_session;
 }
 
-// Demo function to simulate TCP packets
-void simulate_demo()
-{
-	printf("\n=== TCP Session Analysis Demo ===\n");
-	printf("This demo simulates TCP packet capture and analysis.\n");
-	printf("Key features demonstrated:\n");
-	printf("1. Real-time packet parsing\n");
-	printf("2. TCP session statistics\n");
-	printf("3. RTT calculation\n");
-	printf("4. Throughput measurement\n");
-	printf("5. SIGINT signal handling\n");
-	printf("\nPress Ctrl+C to stop and see the analysis report.\n");
-	printf("==================================\n\n");
-
-	// Simulate some TCP traffic for demo
-	struct timeval current_time;
-	gettimeofday(&current_time, NULL);
-	
-	// Initialize demo log
-	memset(&g_log, 0, sizeof(t_pcap_log));
-	g_log.first_ts = current_time;
-	
-	printf("[DEMO] Simulating TCP session...\n");
-	printf("[INFO] Starting packet capture simulation\n");
-	
-	// Simulate packets being captured
-	for (int i = 0; i < 10; i++) {
-		g_log.packets++;
-		g_log.bytes += (100 + (i * 50)); // Simulate varying payload sizes
-		gettimeofday(&current_time, NULL);
-		g_log.last_ts = current_time;
-		
-		printf("[PACKET %lld] TCP 192.168.1.100:%d -> 192.168.1.200:%d, Payload: %d bytes\n",
-		       g_log.packets, 
-		       8000 + i, 
-		       80, 
-		       100 + (i * 50));
-		
-		if (i == 0) {
-			g_log.syn_seen = 1;
-			g_log.syn_ts = current_time;
-			printf("[RTT] SYN packet detected\n");
-		} else if (i == 1) {
-			g_log.syn_ack_seen = 1;
-			double syn_time = g_log.syn_ts.tv_sec * 1000.0 + g_log.syn_ts.tv_usec / 1000.0;
-			double syn_ack_time = current_time.tv_sec * 1000.0 + current_time.tv_usec / 1000.0;
-			g_log.rtt = syn_ack_time - syn_time;
-			printf("[RTT] SYN/ACK packet detected, RTT: %.3f ms\n", g_log.rtt);
-		}
-		
-		usleep(100000); // 100ms delay between packets
-	}
+// SEQ 엔트리 추가 함수
+void add_seq_entry(seq_entry_t **list, u_int seq_num, struct timeval timestamp) {
+    seq_entry_t *new_entry = malloc(sizeof(seq_entry_t));
+    if (new_entry == NULL) return;
+    
+    new_entry->seq_num = seq_num;
+    new_entry->timestamp = timestamp;
+    new_entry->next = *list;
+    *list = new_entry;
 }
 
-int main(int argc, char *argv[])
-{
-	char errbuf[PCAP_ERRBUF_SIZE];
-	char *dev;
+// RTT 계산 함수
+double calculate_rtt(seq_entry_t **list, u_int ack_num, struct timeval current_time) {
+    seq_entry_t *current = *list;
+    seq_entry_t *prev = NULL;
+    
+    while (current != NULL) {
+        if (current->seq_num == ack_num) {
+            // RTT 계산
+            double rtt = (current_time.tv_sec - current->timestamp.tv_sec) * 1000.0;
+            rtt += (current_time.tv_usec - current->timestamp.tv_usec) / 1000.0;
+            
+            // 리스트에서 제거
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                *list = current->next;
+            }
+            free(current);
+            
+            return rtt;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    return -1; // RTT 계산 실패
+}
 
-	printf("TCP Session Analysis Tool\n");
-	printf("=========================\n");
+// 처리율 업데이트 함수
+void update_throughput(tcp_session_t *session, int bytes, struct timeval timestamp) {
+    time_t current_second = timestamp.tv_sec;
+    
+    // 현재 초에 해당하는 엔트리 찾기
+    throughput_entry_t *current = session->throughput_list;
+    while (current != NULL) {
+        if (current->second == current_second) {
+            current->bytes += bytes;
+            return;
+        }
+        current = current->next;
+    }
+    
+    // 새로운 초 엔트리 생성
+    throughput_entry_t *new_entry = malloc(sizeof(throughput_entry_t));
+    if (new_entry == NULL) return;
+    
+    new_entry->second = current_second;
+    new_entry->bytes = bytes;
+    new_entry->next = session->throughput_list;
+    session->throughput_list = new_entry;
+}
 
-	// Initialize pcap library
-	if (pcap_init(PCAP_CHAR_ENC_UTF_8, errbuf) != 0) {
-		printf("[WARNING] pcap_init failed: %s\n", errbuf);
-	}
+// 재전송 탐지 함수
+void detect_retransmission(tcp_session_t *session, u_int seq_num) {
+    seq_entry_t *current = session->seen_seqs;
+    
+    while (current != NULL) {
+        if (current->seq_num == seq_num) {
+            session->retrans_count++;
+            printf("[RETRANSMISSION] SEQ %u detected in session %s:%d <-> %s:%d\n",
+                   seq_num, session->src_ip, session->src_port,
+                   session->dst_ip, session->dst_port);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // 새로운 SEQ 번호 추가
+    add_seq_entry(&session->seen_seqs, seq_num, (struct timeval){0, 0});
+}
 
-	// Set up signal handler
-	signal(SIGINT, signal_handler);
+// 패킷 처리 함수
+void process_packet(tcp_session_t *session, const struct pcap_pkthdr *header,
+                   const struct ip_header *ip_hdr, const struct tcp_header *tcp_hdr, int payload_len) {
+    
+    // 첫 번째 패킷인 경우 시간 기록
+    if (session->total_packets == 0) {
+        session->first_packet_time = header->ts;
+    }
+    session->last_packet_time = header->ts;
+    session->total_packets++;
+    
+    // 바이트 카운트 업데이트
+    if (payload_len > 0) {
+        session->total_bytes += payload_len;
+        update_throughput(session, payload_len, header->ts);
+    }
+    
+    // TCP 플래그 처리
+    u_char flags = tcp_hdr->th_flags;
+    
+    // SYN 패킷 처리 (연결 시작)
+    if (flags & TH_SYN && !(flags & TH_ACK)) {
+        if (!session->syn_seen) {
+            session->syn_seen = 1;
+            session->syn_time = header->ts;
+            printf("[HANDSHAKE] SYN detected for session %s:%d <-> %s:%d\n",
+                   session->src_ip, session->src_port, session->dst_ip, session->dst_port);
+        }
+    }
+    
+    // SYN+ACK 패킷 처리
+    if ((flags & TH_SYN) && (flags & TH_ACK)) {
+        if (session->syn_seen && !session->syn_ack_seen) {
+            session->syn_ack_seen = 1;
+            session->conn_rtt = (header->ts.tv_sec - session->syn_time.tv_sec) * 1000.0;
+            session->conn_rtt += (header->ts.tv_usec - session->syn_time.tv_usec) / 1000.0;
+            printf("[HANDSHAKE] SYN+ACK detected, Connection RTT: %.3f ms\n", session->conn_rtt);
+        }
+    }
+    
+    // ACK 패킷 처리
+    if (flags & TH_ACK) {
+        if (session->syn_ack_seen && !session->established) {
+            session->established = 1;
+            printf("[HANDSHAKE] Connection established for session %s:%d <-> %s:%d\n",
+                   session->src_ip, session->src_port, session->dst_ip, session->dst_port);
+        }
+        
+        // 데이터 RTT 계산
+        double data_rtt = calculate_rtt(&session->pending_seqs, ntohl(tcp_hdr->th_ack), header->ts);
+        if (data_rtt > 0) {
+            session->latest_data_rtt = data_rtt;
+        }
+    }
+    
+    // FIN 패킷 처리 (연결 종료)
+    if (flags & TH_FIN || flags & TH_RST) {
+        if (!session->session_closed) {
+            session->session_closed = 1;
+            printf("[SESSION_END] Session %s:%d <-> %s:%d closed\n",
+                   session->src_ip, session->src_port, session->dst_ip, session->dst_port);
+        }
+    }
+    
+    // 데이터가 있는 패킷의 경우 SEQ 번호 추가 (RTT 계산용)
+    if (payload_len > 0) {
+        add_seq_entry(&session->pending_seqs, ntohl(tcp_hdr->th_seq), header->ts);
+        detect_retransmission(session, ntohl(tcp_hdr->th_seq));
+    }
+}
 
-	// Find best network device
-	dev = find_best_device();
-	if (dev == NULL) {
-		printf("[WARNING] No suitable network device found\n");
-		printf("[INFO] Running in demo mode instead\n");
-		simulate_demo();
-		print_summary();
-		return 0;
-	}
+// pcap 콜백 함수
+void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+    // 이더넷 헤더 확인
+    struct ether_header *eth_header = (struct ether_header *)packet;
+    if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
+        return;
+    }
+    
+    // IP 헤더 파싱
+    struct ip_header *ip_hdr = (struct ip_header *)(packet + sizeof(struct ether_header));
+    int ip_header_len = (ip_hdr->ip_vhl & 0x0f) * 4;
+    
+    if (ip_hdr->ip_p != IPPROTO_TCP) {
+        return;
+    }
+    
+    // TCP 헤더 파싱
+    struct tcp_header *tcp_hdr = (struct tcp_header *)(packet + sizeof(struct ether_header) + ip_header_len);
+    int tcp_header_len = TH_OFF(tcp_hdr) * 4;
+    int payload_len = ntohs(ip_hdr->ip_len) - ip_header_len - tcp_header_len;
+    
+    // 세션 키 생성 및 세션 찾기/생성
+    session_key_t key = create_session_key(ip_hdr, tcp_hdr);
+    tcp_session_t *session = find_or_create_session(&key);
+    
+    if (session == NULL) {
+        return;
+    }
+    
+    // 패킷 처리
+    process_packet(session, header, ip_hdr, tcp_hdr, payload_len);
+}
 
-	printf("[INFO] Selected device: %s\n", dev);
+// 세션 요약 출력 함수
+void print_session_summary(tcp_session_t *session) {
+    printf("\n===== Session Summary =====\n");
+    printf("Session: %s:%d <-> %s:%d\n", 
+           session->src_ip, session->src_port, 
+           session->dst_ip, session->dst_port);
+    printf("Total Packets: %d\n", session->total_packets);
+    printf("Data Transferred: %.2f MB\n", (double)session->total_bytes / (1024 * 1024));
+    
+    if (session->conn_rtt > 0) {
+        printf("Connection RTT: %.1f ms\n", session->conn_rtt);
+    }
+    if (session->latest_data_rtt > 0) {
+        printf("Latest Data RTT: %.1f ms\n", session->latest_data_rtt);
+    }
+    
+    printf("Retransmissions: %d\n", session->retrans_count);
+    
+    // 전체 세션 시간 계산
+    if (session->total_packets > 0) {
+        double duration = (session->last_packet_time.tv_sec - session->first_packet_time.tv_sec) * 1000.0;
+        duration += (session->last_packet_time.tv_usec - session->first_packet_time.tv_usec) / 1000.0;
+        
+        if (duration > 0) {
+            double avg_throughput = (session->total_bytes * 8.0) / (duration / 1000.0) / 1000.0; // kbps
+            printf("Average Throughput: %.2f Kbps\n", avg_throughput);
+        }
+    }
+    
+    // 최대 1초당 처리율 계산
+    long max_bytes_per_sec = 0;
+    throughput_entry_t *current = session->throughput_list;
+    while (current != NULL) {
+        if (current->bytes > max_bytes_per_sec) {
+            max_bytes_per_sec = current->bytes;
+        }
+        current = current->next;
+    }
+    
+    if (max_bytes_per_sec > 0) {
+        printf("Peak Throughput: %.2f Kbps\n", (max_bytes_per_sec * 8.0) / 1000.0);
+    }
+    
+    printf("Status: %s\n", session->session_closed ? "Closed" : "Active");
+    printf("=========================\n");
+}
 
-	// Setup pcap
-	if (setup_pcap(dev) != 0) {
-		printf("[WARNING] Failed to setup pcap on device %s\n", dev);
-		printf("[INFO] Running in demo mode instead\n");
-		simulate_demo();
-		print_summary();
-		return 0;
-	}
+// 모든 세션 출력
+void print_all_sessions() {
+    tcp_session_t *current = session_list;
+    int session_count = 0;
+    
+    printf("\n\n======= TCP SESSION ANALYSIS SUMMARY =======\n");
+    
+    while (current != NULL) {
+        session_count++;
+        print_session_summary(current);
+        current = current->next;
+    }
+    
+    printf("\nTotal Sessions Monitored: %d\n", session_count);
+    printf("============================================\n");
+}
 
-	// Initialize log
-	memset(&g_log, 0, sizeof(t_pcap_log));
-
-	printf("[INFO] Starting TCP packet capture... Press Ctrl+C to stop.\n");
-
-	// Start capture
-	pcap_loop(g_handle, -1, pcap_callback, (u_char *)&g_log);
-
-	// Print results
-	if (g_log.packets > 0) {
-		print_summary();
-	} else {
-		printf("\n[INFO] No packets were captured.\n");
-	}
-
-	// Cleanup
-	if (dev) {
-		free(dev);
-	}
-	pcap_close(g_handle);
-	printf("[INFO] Capture finished.\n");
-
-	return 0;
+// 메모리 정리 함수
+void cleanup_sessions() {
+    tcp_session_t *current = session_list;
+    
+    while (current != NULL) {
+        tcp_session_t *next = current->next;
+        
+        // SEQ 리스트 정리
+        seq_entry_t *seq_current = current->pending_seqs;
+        while (seq_current != NULL) {
+            seq_entry_t *seq_next = seq_current->next;
+            free(seq_current);
+            seq_current = seq_next;
+        }
+        
+        seq_current = current->seen_seqs;
+        while (seq_current != NULL) {
+            seq_entry_t *seq_next = seq_current->next;
+            free(seq_current);
+            seq_current = seq_next;
+        }
+        
+        // 처리율 리스트 정리
+        throughput_entry_t *thr_current = current->throughput_list;
+        while (thr_current != NULL) {
+            throughput_entry_t *thr_next = thr_current->next;
+            free(thr_current);
+            thr_current = thr_next;
+        }
+        
+        free(current);
+        current = next;
+    }
 }
