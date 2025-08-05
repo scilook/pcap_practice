@@ -3,7 +3,7 @@
 
 # Compiler and flags
 CC = gcc
-CFLAGS = #-Wall -Wextra -Werror -std=c99
+CFLAGS = -fsanitize=address #-Wall -Wextra -Werror -std=c99
 LDFLAGS = -lpcap
 
 # Target executable
@@ -12,7 +12,7 @@ TARGET = capture
 DEMO_TARGET = demo_capture
 
 # Source files
-SRC = capture.c
+SRC = capture.c utils.c
 DEMO_SRC = demo_capture.c
 
 # Default target
