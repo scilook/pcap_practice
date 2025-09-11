@@ -3,17 +3,14 @@
 
 # Compiler and flags
 CC = gcc
-CFLAGS = -fsanitize=address #-Wall -Wextra -Werror -std=c99
+CFLAGS = #-fsanitize=address #-Wall -Wextra -Werror -std=c99
 LDFLAGS = -lpcap
 
 # Target executable
-TARGET = capture
-# Alternative target for demo version
-DEMO_TARGET = demo_capture
+TARGET = demo_capture
 
 # Source files
-SRC = capture.c utils.c
-DEMO_SRC = demo_capture.c
+SRC = demo_capture.c utils.c
 
 # Default target
 all: $(TARGET)
@@ -21,12 +18,6 @@ all: $(TARGET)
 # Build main capture program
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
-
-# Build demo version if demo_capture.c exists
-demo: $(DEMO_TARGET)
-
-$(DEMO_TARGET): $(DEMO_SRC)
-	$(CC) $(CFLAGS) -o $(DEMO_TARGET) $(DEMO_SRC) $(LDFLAGS)
 
 # Clean built files
 clean:
@@ -60,7 +51,6 @@ debug: $(TARGET)
 help:
 	@echo "Available targets:"
 	@echo "  all          		- Build the capture program (default)"
-	@echo "  demo         		- Build the demo_capture program"
 	@echo "  clean        		- Remove object files"
 	@echo "  fclean       		- Force clean - remove all generated files"
 	@echo "  re           		- Rebuild everything from scratch (fclean + all)"
@@ -70,4 +60,4 @@ help:
 	@echo "  debug       		- Build with debug symbols"
 	@echo "  help        		- Show this help message"
 
-.PHONY: all demo clean fclean re install-deps install-deps-rpm run debug help
+.PHONY: all clean fclean re install-deps install-deps-rpm run debug help
