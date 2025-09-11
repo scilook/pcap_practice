@@ -1,53 +1,37 @@
-# Makefile for capture.c
-# TCP packet capture and analysis tool using libpcap
-
-# Compiler and flags
 CC = gcc
 CFLAGS = #-fsanitize=address #-Wall -Wextra -Werror -std=c99
 LDFLAGS = -lpcap
 
-# Target executable
 TARGET = demo_capture
 
-# Source files
 SRC = demo_capture.c utils.c
 
-# Default target
 all: $(TARGET)
 
-# Build main capture program
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
 
-# Clean built files
 clean:
 	rm -f *.o
 
-# Force clean - remove all generated files
 fclean: clean
 	rm -f $(TARGET) $(DEMO_TARGET)
 
-# Rebuild everything from scratch
 re: fclean all
 
-# Install dependencies (Ubuntu/Debian)
 install-deps:
 	sudo apt-get update
 	sudo apt-get install libpcap-dev
 
-# Install dependencies (CentOS/RHEL/Fedora)
 install-deps-rpm:
 	sudo yum install libpcap-devel || sudo dnf install libpcap-devel
 
-# Run with elevated privileges (required for packet capture)
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Debug build
 debug: CFLAGS += -g -DDEBUG
 debug: $(TARGET)
 
-# Help target
 help:
 	@echo "Available targets:"
 	@echo "  all          		- Build the capture program (default)"
