@@ -58,7 +58,6 @@ typedef struct s_tcp_session {
 	long long total_bytes;
 	struct timeval first_data_time;
 	struct timeval last_data_time;
-	int has_data;
 
 	// 재전송 탐지 변수
 	int retrans_count;

@@ -198,12 +198,11 @@ void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header,
 	
 	session->total_packets++;
 	if (payload_len > 0) {
-		session->total_bytes += payload_len;
 		
-		if (!session->has_data) {
+		if (!session->total_bytes) {
 			session->first_data_time = header->ts;
-			session->has_data = 1;
 		}
+		session->total_bytes += payload_len;
 		session->last_data_time = header->ts;
 	}
 	
@@ -251,18 +250,14 @@ void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header,
 			printf("[SESSION_END] Session %s:%d <-> %s:%d closed\n",
 				   session->src_ip, session->src_port, session->dst_ip, session->dst_port);
 			
-			if (session->has_data && session->total_bytes > 0) {
-				double duration = (session->last_data_time.tv_sec - session->first_data_time.tv_sec) +
-								 (session->last_data_time.tv_usec - session->first_data_time.tv_usec) / 1000000.0;
+			if (session->total_bytes > 0) {
+				long long duration = (session->last_data_time.tv_sec - session->first_data_time.tv_sec) * 1000000 +
+								 (session->last_data_time.tv_usec - session->first_data_time.tv_usec);
 				
 				if (duration > 0) {
 					printf("[SESSION_END] Throughput: %.2f bytes/sec\n", 
-						   (double)session->total_bytes / duration);
-				} else {
-					printf("[SESSION_END] Throughput: N/A (instantaneous transfer)\n");
+							(double)session->total_bytes * 1000000 / duration);
 				}
-			} else {
-				printf("[SESSION_END] Throughput: N/A (no data transferred)\n");
 			}
 		}
 	}
