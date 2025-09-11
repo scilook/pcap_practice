@@ -22,7 +22,7 @@ typedef struct s_list
 	struct s_list *next;
 } t_list;
 
-// 세션 식별을 위한 구조체
+// 세션 식별 정보 구조체
 typedef struct s_session_key {
 	char src_ip[16];
 	char dst_ip[16];
@@ -36,7 +36,7 @@ typedef struct s_seq_entry {
 	struct timeval timestamp;
 } t_seq_entry;
 
-// 각 TCP 세션을 식별하고 추적하기 위한 구조체
+// TCP 세션 추적 구조체
 typedef struct s_tcp_session {
 	char src_ip[16];
 	char dst_ip[16];
@@ -44,10 +44,9 @@ typedef struct s_tcp_session {
 	unsigned short dst_port;
 
 	// RTT 계산 변수
-	double conn_rtt;
 	double total_rtt;
 	int rtt_count;
-	t_list *pending_seqs;			// 대기 중인 SEQ 번호들 (RTT 계산용)
+	t_list *pending_seqs;			// 대기 중인 SEQ 번호들
 	
 	// 핸드셰이크 추적
 	int syn_seen;

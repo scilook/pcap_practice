@@ -5,7 +5,6 @@ pcap_t *g_handle = NULL;
 
 void signal_handler(int signum);
 void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
-t_tcp_session* find_or_create_session(t_session_key *key);
 void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header, 
 				   const struct ip *ip_hdr, const struct tcphdr *tcp_hdr, int payload_len);
 void add_seq_entry(t_list **list, u_int seq_num, struct timeval timestamp);
@@ -15,6 +14,7 @@ void print_session_summary(t_tcp_session *session);
 void print_all_sessions();
 void cleanup_sessions();
 t_session_key create_session_key(const struct ip *ip_hdr, const struct tcphdr *tcp_hdr);
+t_tcp_session* find_or_create_session(t_session_key *key);
 
 int main(int argc, char *argv[]) {
 	char errbuf[PCAP_ERRBUF_SIZE];
@@ -221,13 +221,13 @@ void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header,
 	if ((flags & TH_SYN) && (flags & TH_ACK)) {
 		if (session->syn_seen && !session->syn_ack_seen) {
 			session->syn_ack_seen = 1;
-			session->conn_rtt = (header->ts.tv_sec - session->syn_time.tv_sec) * 1000.0;
-			session->conn_rtt += (header->ts.tv_usec - session->syn_time.tv_usec) / 1000.0;
+			double conn_rtt = (header->ts.tv_sec - session->syn_time.tv_sec) * 1000.0;
+			conn_rtt += (header->ts.tv_usec - session->syn_time.tv_usec) / 1000.0;
 			
-			session->total_rtt += session->conn_rtt;
+			session->total_rtt += conn_rtt;
 			session->rtt_count++;
 			
-			printf("[HANDSHAKE] SYN+ACK detected, Connection RTT: %.3f ms\n", session->conn_rtt);
+			printf("[HANDSHAKE] SYN+ACK detected, Connection RTT: %.3f ms\n", conn_rtt);
 		}
 	}
 	
