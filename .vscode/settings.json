@@ -4,6 +4,9 @@
         "types.h": "c",
         "ip.h": "c",
         "ethernet.h": "c",
-        "inet.h": "c"
+        "inet.h": "c",
+        "in.h": "c",
+        "pcap.h": "c",
+        "stdio.h": "c"
     }
 }

@@ -8,13 +8,10 @@
 # include <stdlib.h>
 # include <string.h>
 # include <signal.h>
-# include <sys/types.h>
 # include <arpa/inet.h>
 # include <net/ethernet.h>
-# include <netinet/in.h>
 # include <netinet/ip.h>
 # include <netinet/tcp.h>
-# include <time.h>
 
 typedef struct s_list
 {
@@ -22,7 +19,7 @@ typedef struct s_list
 	struct s_list *next;
 } t_list;
 
-// 세션 식별 정보 구조체
+// 세션 식별 정보 키 구조체
 typedef struct s_session_key {
 	char src_ip[16];
 	char dst_ip[16];
@@ -38,6 +35,7 @@ typedef struct s_seq_entry {
 
 // TCP 세션 추적 구조체
 typedef struct s_tcp_session {
+	// 세션 식별 정보
 	char src_ip[16];
 	char dst_ip[16];
 	unsigned short src_port;
@@ -74,17 +72,22 @@ typedef struct s_dev
 	bpf_u_int32 mask;
 } t_dev;
 
-typedef struct s_pcap_log
-{
-	t_list *rtt_list;
-	int packets_cnt;
-	int retrans_cnt;
-	int size;
-} t_pcap_log;
-
 t_list *lst_init(void *content);
 t_list *lst_add_front(t_list **lst, void *content);
 t_list *lst_add_rear(t_list **lst, void *content);
 void lst_clear(t_list **lst);
+
+void signal_handler(int signum);
+void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
+void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header,
+					const struct ip *ip_hdr, const struct tcphdr *tcp_hdr, int payload_len);
+void add_seq_entry(t_list **list, u_int seq_num, struct timeval timestamp);
+double calculate_rtt(t_list **list, u_int ack_num, struct timeval current_time);
+void detect_retransmission(t_tcp_session *session, u_int seq_num);
+void print_session_summary(t_tcp_session *session);
+void print_all_sessions();
+void cleanup_sessions();
+t_session_key create_session_key(const struct ip *ip_hdr, const struct tcphdr *tcp_hdr);
+t_tcp_session* find_or_create_session(t_session_key *key);
 
 #endif /* CAPTURE_H */

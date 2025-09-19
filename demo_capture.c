@@ -3,19 +3,6 @@
 t_list *session_list = NULL;
 pcap_t *g_handle = NULL;
 
-void signal_handler(int signum);
-void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
-void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header, 
-				   const struct ip *ip_hdr, const struct tcphdr *tcp_hdr, int payload_len);
-void add_seq_entry(t_list **list, u_int seq_num, struct timeval timestamp);
-double calculate_rtt(t_list **list, u_int ack_num, struct timeval current_time);
-void detect_retransmission(t_tcp_session *session, u_int seq_num);
-void print_session_summary(t_tcp_session *session);
-void print_all_sessions();
-void cleanup_sessions();
-t_session_key create_session_key(const struct ip *ip_hdr, const struct tcphdr *tcp_hdr);
-t_tcp_session* find_or_create_session(t_session_key *key);
-
 int main(int argc, char *argv[]) {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	char *device;
@@ -38,7 +25,7 @@ int main(int argc, char *argv[]) {
 		mask = 0;
 	}
 
-	g_handle = pcap_open_live(device, BUFSIZ, 1, 65536, errbuf);
+	g_handle = pcap_open_live(device, BUFSIZ, 1, 1024, errbuf);
 	if (g_handle == NULL) {
 		fprintf(stderr, "Error opening device: %s\n", errbuf);
 		return 1;
@@ -225,7 +212,6 @@ void process_packet(t_tcp_session *session, const struct pcap_pkthdr *header,
 			
 			session->total_rtt += conn_rtt;
 			session->rtt_count++;
-			
 			printf("[HANDSHAKE] SYN+ACK detected, Connection RTT: %.3f ms\n", conn_rtt);
 		}
 	}
